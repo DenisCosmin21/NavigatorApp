@@ -12,8 +12,9 @@ import {
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
 import { LocationDetails } from './LocationDetails';
 import { FavoritesList } from './FavoritesList';
+import { RouteHistoryList } from './RouteHistoryList';
 import { getCurrentCoordinates, LatLng } from '../services/locationService';
-import { fetchRoute, RouteData } from '../services/directionsService';
+import { fetchRoute, RouteData, TravelMode } from '../services/directionsService';
 import {
   fetchPlaceSuggestions,
   fetchPlaceDetails,
@@ -25,10 +26,19 @@ import {
   removeFavorite,
   FavoriteLocation,
 } from '../services/favoritesService';
+import {
+  loadSavedRoutes,
+  saveRoute,
+  removeRoute,
+  toggleRouteFavorite,
+  getRoutesByHistory,
+  updateRouteLastUsed,
+} from '../services/savedRoutesService';
+import { SavedRoute } from '../services/savedRouteModel';
 
 const DEFAULT_CENTER: LatLng = {
-  latitude: 51.5074,
-  longitude: -0.1278,
+  latitude: 45.7489,
+  longitude: 21.2087,
 };
 
 
@@ -73,10 +83,16 @@ export function GoogleMap({
   const [favoritesListVisible, setFavoritesListVisible] = useState(false);
   const [loadingFavorites, setLoadingFavorites] = useState(true);
 
+  // Saved routes state
+  const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([]);
+  const [routeHistoryVisible, setRouteHistoryVisible] = useState(false);
+  const [loadingRoutes, setLoadingRoutes] = useState(true);
+
   // Routing and user position
   const [userLocation, setUserLocation] = useState<LatLng | null>(null);
   const [route, setRoute] = useState<RouteData | null>(null);
   const [loadingRoute, setLoadingRoute] = useState(false);
+  const [travelMode, setTravelMode] = useState<TravelMode>('DRIVE');
 
   const handleSearchTextChange = async (text: string) => {
     setSearchQuery(text);
@@ -148,6 +164,16 @@ export function GoogleMap({
     });
   }, []);
 
+  // Load saved routes on mount
+  useEffect(() => {
+    setLoadingRoutes(true);
+    loadSavedRoutes().then(result => {
+      const sorted = getRoutesByHistory(result.routes);
+      setSavedRoutes(sorted);
+      setLoadingRoutes(false);
+    });
+  }, []);
+
   const handleZoom = async (delta: number) => {
     if (!mapRef.current) return;
     const camera = await mapRef.current.getCamera();
@@ -171,6 +197,7 @@ export function GoogleMap({
           longitude: targetLocation.longitude,
         },
         googleApiKey,
+        travelMode,
       );
 
       setRoute(routeData);
@@ -193,7 +220,31 @@ export function GoogleMap({
     } finally {
       setLoadingRoute(false);
     }
-  }, [targetLocation, googleApiKey]);
+  }, [targetLocation, googleApiKey, travelMode, saveRoute, getRoutesByHistory]);
+
+  // Save the currently displayed route to history manually
+  const handleSaveRoute = async () => {
+    if (!route || !userLocation) return;
+
+    const savedRoute: SavedRoute = {
+      name: targetLocation.name,
+      origin: userLocation,
+      destination: {
+        latitude: targetLocation.latitude,
+        longitude: targetLocation.longitude,
+      },
+      destinationName: targetLocation.name,
+      coordinates: route.coordinates,
+      distanceMeters: route.distanceMeters,
+      durationSeconds: route.durationSeconds,
+      travelMode,
+      isFavorite: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    const updatedRoutes = await saveRoute(savedRoute);
+    setSavedRoutes(getRoutesByHistory(updatedRoutes));
+  };
 
   // Favorite toggle handling
   const locationKey = `${targetLocation.latitude.toFixed(
@@ -249,13 +300,69 @@ export function GoogleMap({
     setDetailsVisible(true);
   };
 
+  // Handle selecting a saved route from history
+  const handleSelectSavedRoute = (savedRoute: SavedRoute) => {
+    // Update the last used timestamp
+    if (savedRoute.id) {
+      updateRouteLastUsed(savedRoute.id).then(updated => {
+        setSavedRoutes(getRoutesByHistory(updated));
+      });
+    }
+
+    const newTarget: TargetLocation = {
+      name: savedRoute.name || savedRoute.destinationName,
+      latitude: savedRoute.destination.latitude,
+      longitude: savedRoute.destination.longitude,
+    };
+
+    setTargetLocation(newTarget);
+    
+    // Display the saved route polyline on the map
+    const routeData: RouteData = {
+      coordinates: savedRoute.coordinates,
+      distanceMeters: savedRoute.distanceMeters,
+      durationSeconds: savedRoute.durationSeconds,
+    };
+    setRoute(routeData);
+
+    // Set user location to the origin of the saved route
+    setUserLocation(savedRoute.origin);
+
+    // Fit the map to show the entire route
+    if (savedRoute.coordinates && savedRoute.coordinates.length > 1) {
+      setTimeout(() => {
+        mapRef.current?.fitToCoordinates(savedRoute.coordinates, {
+          edgePadding: { top: 80, right: 40, bottom: 80, left: 40 },
+          animated: true,
+        });
+      }, 300);
+    }
+  };
+
+  // Handle toggling favorite for a saved route
+  const handleToggleRouteFavorite = async (id: string) => {
+    const updated = await toggleRouteFavorite(id);
+    setSavedRoutes(getRoutesByHistory(updated));
+  };
+
+  // Handle deleting a saved route
+  const handleDeleteRoute = async (id: string) => {
+    const updated = await removeRoute(id);
+    setSavedRoutes(getRoutesByHistory(updated));
+  };
+
   return (
     <View style={styles.container}>
       <MapView
         ref={mapRef}
         provider={PROVIDER_GOOGLE}
         style={styles.map}
-        // ... (other props remain the same)
+        initialRegion={{
+          latitude: DEFAULT_CENTER.latitude,
+          longitude: DEFAULT_CENTER.longitude,
+          latitudeDelta: 0.08,
+          longitudeDelta: 0.08,
+        }}
 
         onPress={event => {
           // Prevent iOS from firing onPress at the same time as onPoiClick
@@ -369,13 +476,38 @@ export function GoogleMap({
 
       {/* Distance and Duration Indicator */}
       {route && (
-        <View style={styles.routeBadge}>
-          <Text style={styles.routeBadgeText}>
-            {(route.distanceMeters / 1000).toFixed(1)} km (
-            {Math.round(route.durationSeconds / 60)} min)
-          </Text>
+        <View style={styles.routeBadgeContainer}>
+          <View style={styles.routeBadge}>
+            <Text style={styles.routeBadgeText}>
+              {(route.distanceMeters / 1000).toFixed(1)} km (
+              {Math.round(route.durationSeconds / 60)} min)
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.saveRouteButton}
+            onPress={handleSaveRoute}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.saveRouteButtonText}>💾</Text>
+          </TouchableOpacity>
         </View>
       )}
+
+      {/* Travel Mode Toggle Button */}
+      <TouchableOpacity
+        style={styles.travelModeButton}
+        onPress={() => {
+          const newMode = travelMode === 'DRIVE' ? 'WALK' : 'DRIVE';
+          setTravelMode(newMode);
+          // If directions are already displayed, reload with the new mode
+          if (route) {
+            handleGetDirections();
+          }
+        }}
+        activeOpacity={0.7}
+      >
+        <Text style={styles.travelModeButtonText}>{travelMode === 'DRIVE' ? '🚗' : '🚶'}</Text>
+      </TouchableOpacity>
 
       {/* Favorites Button */}
       <TouchableOpacity
@@ -387,6 +519,20 @@ export function GoogleMap({
         {favorites.length > 0 && (
           <View style={styles.favoritesBadge}>
             <Text style={styles.favoritesBadgeText}>{favorites.length}</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+
+      {/* Route History Button */}
+      <TouchableOpacity
+        style={styles.routeHistoryButton}
+        onPress={() => setRouteHistoryVisible(true)}
+        activeOpacity={0.7}
+      >
+        <Text style={styles.routeHistoryButtonText}>🕐</Text>
+        {savedRoutes.length > 0 && (
+          <View style={styles.routeHistoryBadge}>
+            <Text style={styles.routeHistoryBadgeText}>{savedRoutes.length}</Text>
           </View>
         )}
       </TouchableOpacity>
@@ -411,6 +557,17 @@ export function GoogleMap({
         loading={loadingFavorites}
         onSelect={handleSelectFavorite}
         onClose={() => setFavoritesListVisible(false)}
+      />
+
+      {/* Route History Modal */}
+      <RouteHistoryList
+        visible={routeHistoryVisible}
+        routes={savedRoutes}
+        loading={loadingRoutes}
+        onSelect={handleSelectSavedRoute}
+        onToggleFavorite={handleToggleRouteFavorite}
+        onDelete={handleDeleteRoute}
+        onClose={() => setRouteHistoryVisible(false)}
       />
     </View>
   );
@@ -497,10 +654,15 @@ const styles = StyleSheet.create({
     color: '#1C1C1E',
     lineHeight: 24,
   },
-  routeBadge: {
+  routeBadgeContainer: {
     position: 'absolute',
     bottom: 40,
     left: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  routeBadge: {
     backgroundColor: '#1C1C1E',
     paddingVertical: 10,
     paddingHorizontal: 14,
@@ -515,6 +677,22 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '600',
+  },
+  saveRouteButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#1C1C1E',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 5,
+  },
+  saveRouteButtonText: {
+    fontSize: 18,
   },
   favoritesButton: {
     position: 'absolute',
@@ -553,5 +731,62 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '700',
+  },
+  routeHistoryButton: {
+    position: 'absolute',
+    top: 106,
+    right: 16,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  routeHistoryButtonText: {
+    fontSize: 22,
+  },
+  routeHistoryBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    backgroundColor: '#007AFF',
+    borderRadius: 10,
+    minWidth: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  routeHistoryBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  travelModeButton: {
+    position: 'absolute',
+    top: 162,
+    right: 16,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  travelModeButtonText: {
+    fontSize: 22,
   },
 });
