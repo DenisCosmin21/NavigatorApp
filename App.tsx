@@ -16,7 +16,7 @@ function App() {
     <SafeAreaProvider>
       <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <GoogleMap
-        googleApiKey={''}
+        googleApiKey={'AIzaSyAGQd60jcrOTVZYkcGB3qlv7qIimb0f2f4'}
         initialLatitude={45.7537}
         initialLongitude={21.2257}
       />

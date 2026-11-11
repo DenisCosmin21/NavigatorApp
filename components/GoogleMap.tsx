@@ -31,6 +31,7 @@ const DEFAULT_CENTER: LatLng = {
   longitude: -0.1278,
 };
 
+
 interface TargetLocation {
   name: string;
   latitude: number;
@@ -254,18 +255,38 @@ export function GoogleMap({
         ref={mapRef}
         provider={PROVIDER_GOOGLE}
         style={styles.map}
-        initialCamera={{
-          center: {
-            latitude: targetLocation.latitude,
-            longitude: targetLocation.longitude,
-          },
-          pitch: 0,
-          heading: 0,
-          altitude: 1000,
-          zoom: 13,
+        // ... (other props remain the same)
+
+        onPress={event => {
+          // Prevent iOS from firing onPress at the same time as onPoiClick
+          if ((event.nativeEvent as any).action === 'poi-click') return;
+
+          const { latitude, longitude } = event.nativeEvent.coordinate;
+
+          setTargetLocation({
+            name: `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`,
+            latitude,
+            longitude,
+          });
+
+          setRoute(null);
+          setDetailsVisible(true);
         }}
-        showsUserLocation
-        showsMyLocationButton={false}
+        onPoiClick={event => {
+          const { coordinate, name } = event.nativeEvent;
+          setTargetLocation({
+            name:
+              name ||
+              `${coordinate.latitude.toFixed(
+                4,
+              )}, ${coordinate.longitude.toFixed(4)}`,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude,
+          });
+
+          setRoute(null);
+          setDetailsVisible(true);
+        }}
       >
         <Marker
           coordinate={{
