@@ -64,7 +64,7 @@ export function LocationDetails({
             {loadingRoute ? (
               <ActivityIndicator color="#FFFFFF" />
             ) : (
-              <Text style={styles.directionsButtonText}>Get Directions</Text>
+              <Text style={styles.directionsButtonText}>See Directions</Text>
             )}
           </TouchableOpacity>
 

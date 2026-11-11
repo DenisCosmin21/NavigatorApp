@@ -93,6 +93,8 @@ export function GoogleMap({
   const [route, setRoute] = useState<RouteData | null>(null);
   const [loadingRoute, setLoadingRoute] = useState(false);
   const [travelMode, setTravelMode] = useState<TravelMode>('DRIVE');
+  const [showingDirections, setShowingDirections] = useState(false);
+  const [navigationActive, setNavigationActive] = useState(false);
 
   const handleSearchTextChange = async (text: string) => {
     setSearchQuery(text);
@@ -202,6 +204,7 @@ export function GoogleMap({
 
       setRoute(routeData);
       setDetailsVisible(false);
+      setShowingDirections(true);
 
       // Guard against empty coordinate arrays that cause native crashes
       if (routeData.coordinates && routeData.coordinates.length > 1) {
@@ -221,6 +224,25 @@ export function GoogleMap({
       setLoadingRoute(false);
     }
   }, [targetLocation, googleApiKey, travelMode, saveRoute, getRoutesByHistory]);
+
+  // Close the current directions view and clear the route
+  const handleCloseDirections = () => {
+    setRoute(null);
+    setShowingDirections(false);
+    setNavigationActive(false);
+  };
+
+  // Lock the travel mode - user cannot change between car/foot anymore
+  const handleStartNavigation = () => {
+    setNavigationActive(true);
+  };
+
+  // Cancel navigation mode and close directions
+  const handleCancelNavigation = () => {
+    setNavigationActive(false);
+    setRoute(null);
+    setShowingDirections(false);
+  };
 
   // Save the currently displayed route to history manually
   const handleSaveRoute = async () => {
@@ -324,6 +346,7 @@ export function GoogleMap({
       durationSeconds: savedRoute.durationSeconds,
     };
     setRoute(routeData);
+    setShowingDirections(true);
 
     // Set user location to the origin of the saved route
     setUserLocation(savedRoute.origin);
@@ -368,6 +391,9 @@ export function GoogleMap({
           // Prevent iOS from firing onPress at the same time as onPoiClick
           if ((event.nativeEvent as any).action === 'poi-click') return;
 
+          // Don't allow changing location while directions are showing
+          if (showingDirections) return;
+
           const { latitude, longitude } = event.nativeEvent.coordinate;
 
           setTargetLocation({
@@ -380,6 +406,9 @@ export function GoogleMap({
           setDetailsVisible(true);
         }}
         onPoiClick={event => {
+          // Don't allow changing location while directions are showing
+          if (showingDirections) return;
+
           const { coordinate, name } = event.nativeEvent;
           setTargetLocation({
             name:
@@ -401,7 +430,11 @@ export function GoogleMap({
             longitude: targetLocation.longitude,
           }}
           title={targetLocation.name}
-          onPress={() => setDetailsVisible(true)}
+          onPress={() => {
+            if (!showingDirections) {
+              setDetailsVisible(true);
+            }
+          }}
         />
 
         {userLocation && route && (
@@ -474,8 +507,8 @@ export function GoogleMap({
         </TouchableOpacity>
       </View>
 
-      {/* Distance and Duration Indicator */}
-      {route && (
+      {/* Distance and Duration Indicator - only visible when showing directions */}
+      {showingDirections && route && (
         <View style={styles.routeBadgeContainer}>
           <View style={styles.routeBadge}>
             <Text style={styles.routeBadgeText}>
@@ -483,31 +516,58 @@ export function GoogleMap({
               {Math.round(route.durationSeconds / 60)} min)
             </Text>
           </View>
-          <TouchableOpacity
-            style={styles.saveRouteButton}
-            onPress={handleSaveRoute}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.saveRouteButtonText}>💾</Text>
-          </TouchableOpacity>
+          {!navigationActive && (
+            <>
+              <TouchableOpacity
+                style={styles.saveRouteButton}
+                onPress={handleSaveRoute}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.saveRouteButtonText}>💾</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.startNavigationButton}
+                onPress={handleStartNavigation}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.startNavigationButtonText}>▶</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.closeDirectionsButton}
+                onPress={handleCloseDirections}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.closeDirectionsButtonText}>✕</Text>
+              </TouchableOpacity>
+            </>
+          )}
+          {navigationActive && (
+            <TouchableOpacity
+              style={styles.cancelNavigationButton}
+              onPress={handleCancelNavigation}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.cancelNavigationButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
-      {/* Travel Mode Toggle Button */}
-      <TouchableOpacity
-        style={styles.travelModeButton}
-        onPress={() => {
-          const newMode = travelMode === 'DRIVE' ? 'WALK' : 'DRIVE';
-          setTravelMode(newMode);
-          // If directions are already displayed, reload with the new mode
-          if (route) {
+      {/* Travel Mode Toggle Button - only visible when showing directions and navigation is NOT active */}
+      {showingDirections && !navigationActive && (
+        <TouchableOpacity
+          style={styles.travelModeButton}
+          onPress={() => {
+            const newMode = travelMode === 'DRIVE' ? 'WALK' : 'DRIVE';
+            setTravelMode(newMode);
+            // Reload directions with the new mode
             handleGetDirections();
-          }
-        }}
-        activeOpacity={0.7}
-      >
-        <Text style={styles.travelModeButtonText}>{travelMode === 'DRIVE' ? '🚗' : '🚶'}</Text>
-      </TouchableOpacity>
+          }}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.travelModeButtonText}>{travelMode === 'DRIVE' ? '🚗' : '🚶'}</Text>
+        </TouchableOpacity>
+      )}
 
       {/* Favorites Button */}
       <TouchableOpacity
@@ -693,6 +753,60 @@ const styles = StyleSheet.create({
   },
   saveRouteButtonText: {
     fontSize: 18,
+  },
+  startNavigationButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#34C759',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 5,
+  },
+  startNavigationButtonText: {
+    fontSize: 18,
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  cancelNavigationButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 5,
+  },
+  cancelNavigationButtonText: {
+    fontSize: 15,
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  closeDirectionsButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3,
+    elevation: 5,
+  },
+  closeDirectionsButtonText: {
+    fontSize: 18,
+    color: '#FFFFFF',
+    fontWeight: '700',
   },
   favoritesButton: {
     position: 'absolute',
