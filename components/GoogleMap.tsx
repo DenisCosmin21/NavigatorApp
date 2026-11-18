@@ -1,27 +1,36 @@
 
+
 import React, {useEffect, useRef, useState} from 'react';
 import {
+  Alert,
   Animated,
-  Easing,
   NativeEventEmitter,
   NativeModules,
-  PermissionsAndroid,
-  Platform,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
-import MapView, {Marker, PROVIDER_GOOGLE} from 'react-native-maps';
-import Geolocation from '@react-native-community/geolocation';
+import MapView, {Marker, Polyline, PROVIDER_GOOGLE} from 'react-native-maps';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import {DARK_MAP_STYLE} from './map/darkMapStyle';
+import {LocatingScreen} from './map/LocatingScreen';
+import {useLiveLocation} from './map/useLiveLocation';
+import {LocationDetails} from './LocationDetails';
+import {FavoritesList} from './FavoritesList';
+import {fetchRoute, type RouteData} from '../services/directionsService';
+import {
+  loadFavorites,
+  addFavorite,
+  removeFavorite,
+  type FavoriteLocation,
+} from '../services/favoritesService';
 import {
   DestinationSearch,
   type Destination,
 } from './search/DestinationSearch';
 
 const MIN_SPEED_KMH = 2;
-const SPEED_HIDE_DELAY = 5000;
 const ACCELERATION_THRESHOLD = 0.8;
 const GYRO_THRESHOLD = 0.18;
 
@@ -38,6 +47,7 @@ type PlaceSuggestion = {
 type PlacesNativeModule = {
   searchPlaces(query: string): Promise<PlaceSuggestion[]>;
   getPlaceDetails(placeId: string): Promise<Destination>;
+  getApiKey?(): Promise<string>;
 };
 
 type MotionNativeModule = {
@@ -61,157 +71,6 @@ const MotionModule = NativeModules.MotionModule as
   | MotionNativeModule
   | undefined;
 
-const DARK_MAP_STYLE = [
-  {
-    elementType: 'geometry',
-    stylers: [{color: '#11213A'}],
-  },
-  {
-    elementType: 'labels.text.fill',
-    stylers: [{color: '#9BAFCE'}],
-  },
-  {
-    elementType: 'labels.text.stroke',
-    stylers: [{color: '#0B1830'}],
-  },
-  {
-    featureType: 'administrative',
-    elementType: 'geometry',
-    stylers: [{color: '#263957'}],
-  },
-  {
-    featureType: 'landscape',
-    elementType: 'geometry',
-    stylers: [{color: '#101E34'}],
-  },
-  {
-    featureType: 'poi',
-    elementType: 'geometry',
-    stylers: [{color: '#172B44'}],
-  },
-  {
-    featureType: 'poi.park',
-    elementType: 'geometry',
-    stylers: [{color: '#123639'}],
-  },
-  {
-    featureType: 'road',
-    elementType: 'geometry',
-    stylers: [{color: '#2A4061'}],
-  },
-  {
-    featureType: 'road.highway',
-    elementType: 'geometry',
-    stylers: [{color: '#315B94'}],
-  },
-  {
-    featureType: 'road.local',
-    elementType: 'geometry',
-    stylers: [{color: '#263A56'}],
-  },
-  {
-    featureType: 'transit',
-    elementType: 'geometry',
-    stylers: [{color: '#24405E'}],
-  },
-  {
-    featureType: 'water',
-    elementType: 'geometry',
-    stylers: [{color: '#07152D'}],
-  },
-];
-
-function LocatingScreen({
-  error,
-  onRetry,
-  onOpenAccount,
-}: {
-  error: string;
-  onRetry: () => void;
-  onOpenAccount: () => void;
-}) {
-  const pulse = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    const animation = Animated.loop(
-      Animated.timing(pulse, {
-        toValue: 1,
-        duration: 1700,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }),
-    );
-
-    animation.start();
-
-    return () => animation.stop();
-  }, [pulse]);
-
-  return (
-    <View style={styles.locatingScreen}>
-      <TouchableOpacity
-        style={styles.locatingAccount}
-        onPress={onOpenAccount}>
-        <Text style={styles.locatingAccountText}>
-          Cont
-        </Text>
-      </TouchableOpacity>
-
-      <View style={styles.radarContainer}>
-        <Animated.View
-          style={[
-            styles.radarPulse,
-            {
-              opacity: pulse.interpolate({
-                inputRange: [0, 1],
-                outputRange: [0.9, 0],
-              }),
-              transform: [
-                {
-                  scale: pulse.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [0.65, 1.5],
-                  }),
-                },
-              ],
-            },
-          ]}
-        />
-
-        <View style={styles.radarOuter}>
-          <View style={styles.radarMiddle}>
-            <View style={styles.radarCenter}>
-              <Text style={styles.radarArrow}>
-                ➤
-              </Text>
-            </View>
-          </View>
-        </View>
-      </View>
-
-      <Text style={styles.locatingTitle}>
-        Detectăm locația...
-      </Text>
-
-      {error !== '' && (
-        <>
-          <Text style={styles.locatingError}>
-            {error}
-          </Text>
-
-          <TouchableOpacity
-            style={styles.retryButton}
-            onPress={onRetry}>
-            <Text style={styles.retryText}>
-              Reîncearcă
-            </Text>
-          </TouchableOpacity>
-        </>
-      )}
-    </View>
-  );
-}
-
 export function GoogleMap({
   destination,
   onDestinationChange,
@@ -223,12 +82,8 @@ export function GoogleMap({
   const lastLocationRef = useRef<Coordinates | null>(null);
   const followLocationRef = useRef(destination === null);
   const searchRequestRef = useRef(0);
-  const gpsShownRef = useRef(false);
 
   const searchTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const speedTimerRef =
     useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const motionTimerRef =
@@ -242,27 +97,6 @@ export function GoogleMap({
 
   const toastY =
     useRef(new Animated.Value(-10)).current;
-
-  const [initialLocation, setInitialLocation] =
-    useState<Coordinates | null>(null);
-
-  const [currentLocation, setCurrentLocation] =
-    useState<Coordinates | null>(null);
-
-  const [locationAllowed, setLocationAllowed] =
-    useState(false);
-
-  const [locationError, setLocationError] =
-    useState('');
-
-  const [retryKey, setRetryKey] =
-    useState(0);
-
-  const [gpsToast, setGpsToast] =
-    useState(false);
-
-  const [speedKmh, setSpeedKmh] =
-    useState(0);
 
   const [accelerating, setAccelerating] =
     useState(false);
@@ -291,175 +125,48 @@ export function GoogleMap({
   const [focusSearch, setFocusSearch] =
     useState(0);
 
+  // Logic from Denis's favorites and directions services.
+  const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
+  const [favoritesLoading, setFavoritesLoading] = useState(true);
+  const [favoritesListVisible, setFavoritesListVisible] = useState(false);
+  const [detailsVisible, setDetailsVisible] = useState(false);
+  const [route, setRoute] = useState<RouteData | null>(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+
   useEffect(() => {
     let active = true;
-    let watchId: number | null = null;
-
-    const onPosition = (position: {
-      coords: {
-        latitude: number;
-        longitude: number;
-        speed?: number | null;
-      };
-    }) => {
-      if (!active) {
-        return;
-      }
-
-      const {
-        latitude,
-        longitude,
-        speed,
-      } = position.coords;
-
-      const next = {
-        latitude,
-        longitude,
-      };
-
-      lastLocationRef.current = next;
-
-      setCurrentLocation(next);
-
-      setInitialLocation(
-        previous => previous ?? next,
-      );
-
-      setLocationError('');
-
-      if (!gpsShownRef.current) {
-        gpsShownRef.current = true;
-        setGpsToast(true);
-      }
-
-      const kmh =
-        speed != null &&
-        Number.isFinite(speed) &&
-        speed >= 0
-          ? speed * 3.6
-          : 0;
-
-      if (kmh >= MIN_SPEED_KMH) {
-        setSpeedKmh(
-          Math.max(2, Math.round(kmh)),
-        );
-
-        if (speedTimerRef.current !== null) {
-          clearTimeout(speedTimerRef.current);
-        }
-
-        speedTimerRef.current = setTimeout(() => {
-          if (active) {
-            setSpeedKmh(0);
-          }
-        }, SPEED_HIDE_DELAY);
-      }
-
-      if (
-        followLocationRef.current &&
-        mapRef.current
-      ) {
-        mapRef.current.animateCamera(
-          {
-            center: next,
-          },
-          {
-            duration: 450,
-          },
-        );
-      }
-    };
-
-    const start = async () => {
-      try {
-        if (Platform.OS === 'android') {
-          const result =
-            await PermissionsAndroid.request(
-              PermissionsAndroid.PERMISSIONS
-                .ACCESS_FINE_LOCATION,
-            );
-
-          if (
-            result !==
-            PermissionsAndroid.RESULTS.GRANTED
-          ) {
-            if (active) {
-              setLocationError(
-                'Permite localizarea precisă din setările telefonului.',
-              );
-            }
-
-            return;
-          }
-        }
-
-        if (!active) {
-          return;
-        }
-
-        setLocationAllowed(true);
-
-        Geolocation.getCurrentPosition(
-          onPosition,
-          error => {
-            if (
-              active &&
-              !lastLocationRef.current
-            ) {
-              setLocationError(
-                'Nu am putut obține locația: ' +
-                  error.message,
-              );
-            }
-          },
-          {
-            enableHighAccuracy: true,
-            timeout: 15000,
-            maximumAge: 2000,
-          },
-        );
-
-        watchId = Geolocation.watchPosition(
-          onPosition,
-          error => {
-            if (active) {
-              setLocationError(
-                'Eroare GPS: ' + error.message,
-              );
-
-              setSpeedKmh(0);
-            }
-          },
-          {
-            enableHighAccuracy: true,
-            distanceFilter: 0,
-            interval: 2000,
-            fastestInterval: 1000,
-          },
-        );
-      } catch {
+    loadFavorites()
+      .then(result => {
         if (active) {
-          setLocationError(
-            'Localizarea nu a putut fi activată.',
-          );
+          setFavorites(result.favorites);
+          setFavoritesLoading(false);
         }
-      }
-    };
-
-    start();
-
+      })
+      .catch(() => {
+        if (active) {
+          setFavoritesLoading(false);
+        }
+      });
     return () => {
       active = false;
-
-      if (watchId !== null) {
-        Geolocation.clearWatch(watchId);
-      }
-
-      if (speedTimerRef.current !== null) {
-        clearTimeout(speedTimerRef.current);
-      }
     };
-  }, [retryKey]);
+  }, []);
+
+  const {
+    initialLocation,
+    currentLocation,
+    locationAllowed,
+    locationError,
+    gpsToast,
+    setGpsToast,
+    speedKmh,
+    retryLocation,
+  } = useLiveLocation(next => {
+    lastLocationRef.current = next;
+    if (followLocationRef.current && mapRef.current) {
+      mapRef.current.animateCamera({center: next}, {duration: 450});
+    }
+  });
 
   useEffect(() => {
     if (!gpsToast) {
@@ -653,6 +360,8 @@ export function GoogleMap({
     followLocationRef.current = false;
 
     onDestinationChange(next);
+    setRoute(null);
+    setDetailsVisible(false);
 
     cancelSearch();
 
@@ -670,6 +379,8 @@ export function GoogleMap({
 
   const clearDestination = () => {
     onDestinationChange(null);
+    setRoute(null);
+    setDetailsVisible(false);
 
     cancelSearch();
 
@@ -685,6 +396,89 @@ export function GoogleMap({
         },
         {duration: 500},
       );
+    }
+
+  };
+
+  const favoriteKey = (latitude: number, longitude: number) =>
+    `${latitude.toFixed(4)},${longitude.toFixed(4)}`;
+
+  const currentFavorite =
+    destination !== null &&
+    favorites.some(
+      favorite =>
+        favoriteKey(favorite.latitude, favorite.longitude) ===
+        favoriteKey(destination.latitude, destination.longitude),
+    );
+
+  const handleToggleFavorite = async () => {
+    if (!destination) {
+      return;
+    }
+    try {
+      if (currentFavorite) {
+        setFavorites(
+          await removeFavorite(destination.latitude, destination.longitude),
+        );
+      } else {
+        setFavorites(
+          await addFavorite({
+            name: destination.name,
+            latitude: destination.latitude,
+            longitude: destination.longitude,
+          }),
+        );
+      }
+    } catch (error) {
+      Alert.alert('Favorite', 'Nu am putut salva locația.');
+      console.warn('Favorites error:', error);
+    }
+  };
+
+  const handleSelectFavorite = (favorite: FavoriteLocation) => {
+    selectDestination({
+      id: `favorite-${favorite.latitude}-${favorite.longitude}`,
+      name: favorite.name,
+      latitude: favorite.latitude,
+      longitude: favorite.longitude,
+    });
+    setFavoritesListVisible(false);
+    setDetailsVisible(true);
+  };
+
+  const handleGetDirections = async () => {
+    if (!destination || !lastLocationRef.current) {
+      Alert.alert('Traseu', 'Locația curentă nu este încă disponibilă.');
+      return;
+    }
+    setRouteLoading(true);
+    try {
+      // The Android manifest key is exposed by the existing PlacesModule.
+      // Requires adding getApiKey() to PlacesModule.kt (included separately).
+      const key = await PlacesModule?.getApiKey?.();
+      if (!key) {
+        throw new Error('Cheia Google Maps nu este disponibilă pentru Routes API.');
+      }
+      const result = await fetchRoute(
+        lastLocationRef.current,
+        {latitude: destination.latitude, longitude: destination.longitude},
+        key,
+      );
+      setRoute(result);
+      setDetailsVisible(false);
+      if (result.coordinates.length > 1) {
+        setTimeout(() => {
+          mapRef.current?.fitToCoordinates(result.coordinates, {
+            edgePadding: {top: 105, right: 70, bottom: 165, left: 70},
+            animated: true,
+          });
+        }, 250);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nu am putut calcula ruta.';
+      Alert.alert('Traseu', message);
+    } finally {
+      setRouteLoading(false);
     }
   };
 
@@ -868,13 +662,7 @@ export function GoogleMap({
     return (
       <LocatingScreen
         error={locationError}
-        onRetry={() => {
-          setLocationError('');
-
-          setRetryKey(
-            value => value + 1,
-          );
-        }}
+        onRetry={retryLocation}
         onOpenAccount={onOpenAccount}
       />
     );
@@ -893,6 +681,7 @@ export function GoogleMap({
         ref={mapRef}
         provider={PROVIDER_GOOGLE}
         style={styles.map}
+
         customMapStyle={DARK_MAP_STYLE}
         initialRegion={{
           ...initialCenter,
@@ -939,6 +728,14 @@ export function GoogleMap({
           </Marker>
         )}
 
+        {route && route.coordinates.length > 1 && (
+          <Polyline
+            coordinates={route.coordinates}
+            strokeColor="#3B82F6"
+            strokeWidth={5}
+          />
+        )}
+
         {destination !== null && (
           <Marker
             coordinate={{
@@ -947,9 +744,11 @@ export function GoogleMap({
             }}
             title={destination.name}
             pinColor="#3B82F6"
+            onPress={() => setDetailsVisible(true)}
           />
         )}
       </MapView>
+
 
       <View
         style={[
@@ -1083,6 +882,26 @@ export function GoogleMap({
         </TouchableOpacity>
       </View>
 
+      <TouchableOpacity
+        style={[styles.favoritesFloating, {bottom: bottom + 220}]}
+        onPress={() => setFavoritesListVisible(true)}
+        accessibilityLabel="Locații favorite">
+        <Text style={styles.favoritesFloatingText}>★</Text>
+        {favorites.length > 0 && (
+          <View style={styles.favoriteCountBadge}>
+            <Text style={styles.favoriteCountText}>{favorites.length}</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+
+      {route && (
+        <View style={[styles.routeBadge, {bottom: bottom + 95}]}>
+          <Text style={styles.routeBadgeText}>
+            {(route.distanceMeters / 1000).toFixed(1)} km · {Math.round(route.durationSeconds / 60)} min
+          </Text>
+        </View>
+      )}
+
       {destination !== null && (
         <View
           style={[
@@ -1121,19 +940,8 @@ export function GoogleMap({
 
           <TouchableOpacity
             style={styles.destinationAction}
-            onPress={() =>
-              mapRef.current?.animateCamera(
-                {
-                  center: {
-                    latitude: destination.latitude,
-                    longitude: destination.longitude,
-                  },
-                  zoom: 15,
-                },
-                {duration: 500},
-              )
-            }
-            accessibilityLabel="Centrează harta pe destinație">
+            onPress={() => setDetailsVisible(true)}
+            accessibilityLabel="Detalii, favorite și traseu">
 
             <Text style={styles.destinationArrow}>
               ➜
@@ -1158,6 +966,28 @@ export function GoogleMap({
 
         </View>
       )}
+
+      {destination !== null && (
+        <LocationDetails
+          name={destination.name}
+          latitude={destination.latitude}
+          longitude={destination.longitude}
+          visible={detailsVisible}
+          isFavorite={!!currentFavorite}
+          loadingRoute={routeLoading}
+          onToggleFavorite={handleToggleFavorite}
+          onGetDirections={handleGetDirections}
+          onClose={() => setDetailsVisible(false)}
+        />
+      )}
+
+      <FavoritesList
+        visible={favoritesListVisible}
+        favorites={favorites}
+        loading={favoritesLoading}
+        onSelect={handleSelectFavorite}
+        onClose={() => setFavoritesListVisible(false)}
+      />
     </View>
   );
 }
@@ -1172,106 +1002,6 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  locatingScreen: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#07142E',
-    paddingHorizontal: 24,
-  },
-
-  locatingAccount: {
-    position: 'absolute',
-    top: 45,
-    right: 20,
-    padding: 12,
-  },
-
-  locatingAccountText: {
-    color: '#90C6FF',
-    fontWeight: '700',
-  },
-
-  radarContainer: {
-    width: 245,
-    height: 245,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  radarPulse: {
-    position: 'absolute',
-    width: 205,
-    height: 205,
-    borderRadius: 103,
-    borderWidth: 2,
-    borderColor: '#2E95FF',
-    backgroundColor: 'rgba(20,105,242,0.14)',
-  },
-
-  radarOuter: {
-    width: 205,
-    height: 205,
-    borderRadius: 103,
-    borderWidth: 2,
-    borderColor: '#204C87',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  radarMiddle: {
-    width: 140,
-    height: 140,
-    borderRadius: 70,
-    borderWidth: 2,
-    borderColor: '#2B69B1',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  radarCenter: {
-    width: 84,
-    height: 84,
-    borderRadius: 42,
-    backgroundColor: '#135FCB',
-    borderColor: '#399FFF',
-    borderWidth: 2,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  radarArrow: {
-    fontSize: 48,
-    color: '#FFFFFF',
-    transform: [{rotate: '-45deg'}],
-  },
-
-  locatingTitle: {
-    fontSize: 22,
-    fontWeight: '800',
-    color: '#FFFFFF',
-    marginTop: 12,
-  },
-
-  locatingError: {
-    fontSize: 12,
-    color: '#FFD0D0',
-    marginTop: 20,
-    textAlign: 'center',
-  },
-
-  retryButton: {
-    marginTop: 18,
-    borderRadius: 12,
-    paddingHorizontal: 22,
-    paddingVertical: 12,
-    backgroundColor: '#236DE6',
-  },
-
-  retryText: {
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
 
   topRow: {
     position: 'absolute',
@@ -1558,5 +1288,42 @@ const styles = StyleSheet.create({
   errorBannerText: {
     color: '#FFE4E8',
     fontSize: 12,
+
   },
+
+
+  favoritesFloating: {
+    position: 'absolute',
+    right: 15,
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: '#4779BC',
+    backgroundColor: '#142C4E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 6,
+  },
+  favoritesFloatingText: {fontSize: 27, color: '#FFD36D'},
+  favoriteCountBadge: {
+    position: 'absolute',
+    right: -5,
+    top: -5,
+    borderRadius: 10,
+    paddingHorizontal: 5,
+    backgroundColor: '#236DE6',
+  },
+  favoriteCountText: {color: '#FFFFFF', fontSize: 11, fontWeight: '700'},
+  routeBadge: {
+    position: 'absolute',
+    alignSelf: 'center',
+    borderRadius: 16,
+    backgroundColor: '#142C4E',
+    borderWidth: 1,
+    borderColor: '#4779BC',
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+  },
+  routeBadgeText: {color: '#FFFFFF', fontSize: 13, fontWeight: '700'},
 });
