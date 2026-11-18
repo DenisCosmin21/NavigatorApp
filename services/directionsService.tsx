@@ -6,8 +6,44 @@ export interface RouteData {
   durationSeconds: number;
 }
 
+/** Codifică puncte de coordonate în string polyline compact (format Google) */
+export function encodePolyline(points: LatLng[]): string {
+  let result = '';
+  let prevLat = 0;
+  let prevLng = 0;
+
+  for (const point of points) {
+    const lat = Math.round(point.latitude * 1e5);
+    const lng = Math.round(point.longitude * 1e5);
+    const dlat = lat - prevLat;
+    const dlng = lng - prevLng;
+
+    result += encodeSignedInteger(dlat);
+    result += encodeSignedInteger(dlng);
+
+    prevLat = lat;
+    prevLng = lng;
+  }
+
+  return result;
+}
+
+function encodeSignedInteger(value: number): string {
+  let sgn_value = value << 1;
+  if (value < 0) {
+    sgn_value = ~sgn_value;
+  }
+  let encoded = '';
+  while (sgn_value >= 0x20) {
+    encoded += String.fromCharCode((0x20 | (sgn_value & 0x1f)) + 63);
+    sgn_value >>= 5;
+  }
+  encoded += String.fromCharCode(sgn_value + 63);
+  return encoded;
+}
+
 /** Decodifică string-ul polyline returnat de Google în puncte de coordonate */
-function decodePolyline(encoded: string): LatLng[] {
+export function decodePolyline(encoded: string): LatLng[] {
   const points: LatLng[] = [];
   let index = 0;
   const len = encoded.length;
@@ -42,10 +78,13 @@ function decodePolyline(encoded: string): LatLng[] {
   return points;
 }
 
+export type TravelMode = 'DRIVE' | 'WALK';
+
 export async function fetchRoute(
   origin: LatLng,
   destination: LatLng,
   apiKey: string,
+  travelMode: TravelMode = 'DRIVE',
 ): Promise<RouteData> {
   const url = 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
@@ -75,7 +114,7 @@ export async function fetchRoute(
           },
         },
       },
-      travelMode: 'DRIVE',
+      travelMode,
     }),
   });
 
