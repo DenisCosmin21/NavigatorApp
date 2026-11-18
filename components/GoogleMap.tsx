@@ -1,10 +1,9 @@
 
-
+import {openDirections} from '../services/navigationService';
 import React, {useEffect, useRef, useState} from 'react';
 import {
   Alert,
   Animated,
-  NativeEventEmitter,
   NativeModules,
   StyleSheet,
   Text,
@@ -16,44 +15,29 @@ import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {DARK_MAP_STYLE} from './map/darkMapStyle';
 import {LocatingScreen} from './map/LocatingScreen';
 import {useLiveLocation} from './map/useLiveLocation';
+import {useMotionSensors} from './map/useMotionSensors';
+import {usePlaceSearch} from './map/usePlaceSearch';
+import {useFavoriteLocations} from './map/useFavoriteLocations';
 import {LocationDetails} from './LocationDetails';
 import {FavoritesList} from './FavoritesList';
 import {fetchRoute, type RouteData} from '../services/directionsService';
-import {
-  loadFavorites,
-  addFavorite,
-  removeFavorite,
-  type FavoriteLocation,
-} from '../services/favoritesService';
+import type {FavoriteLocation} from '../services/favoritesService';
 import {
   DestinationSearch,
   type Destination,
 } from './search/DestinationSearch';
 
 const MIN_SPEED_KMH = 2;
-const ACCELERATION_THRESHOLD = 0.8;
-const GYRO_THRESHOLD = 0.18;
 
 type Coordinates = {
   latitude: number;
   longitude: number;
 };
 
-type PlaceSuggestion = {
-  id: string;
-  name: string;
-};
-
 type PlacesNativeModule = {
-  searchPlaces(query: string): Promise<PlaceSuggestion[]>;
-  getPlaceDetails(placeId: string): Promise<Destination>;
   getApiKey?(): Promise<string>;
 };
 
-type MotionNativeModule = {
-  addListener(eventName: string): void;
-  removeListeners(count: number): void;
-};
 
 type GoogleMapProps = {
   destination: Destination | null;
@@ -67,9 +51,6 @@ const PlacesModule = NativeModules.PlacesModule as
   | PlacesNativeModule
   | undefined;
 
-const MotionModule = NativeModules.MotionModule as
-  | MotionNativeModule
-  | undefined;
 
 export function GoogleMap({
   destination,
@@ -81,16 +62,7 @@ export function GoogleMap({
   const mapRef = useRef<MapView>(null);
   const lastLocationRef = useRef<Coordinates | null>(null);
   const followLocationRef = useRef(destination === null);
-  const searchRequestRef = useRef(0);
 
-  const searchTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const motionTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const gyroTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const toastOpacity =
     useRef(new Animated.Value(0)).current;
@@ -98,26 +70,16 @@ export function GoogleMap({
   const toastY =
     useRef(new Animated.Value(-10)).current;
 
-  const [accelerating, setAccelerating] =
-    useState(false);
 
-  const [rotating, setRotating] =
-    useState(false);
-
-  const [heading, setHeading] =
-    useState<number | null>(null);
+  const {accelerating, rotating, heading} = useMotionSensors();
 
   const [mapRotated, setMapRotated] =
     useState(false);
 
-  const [suggestions, setSuggestions] =
-    useState<Destination[]>([]);
-
-  const [searchError, setSearchError] =
-    useState('');
-
-  const [searchLoading, setSearchLoading] =
-    useState(false);
+  const {
+    suggestions, searchError, searchLoading,
+    cancelSearch, onQueryChange, resolveSuggestion,
+  } = usePlaceSearch();
 
   const [searchKey, setSearchKey] =
     useState(0);
@@ -125,32 +87,14 @@ export function GoogleMap({
   const [focusSearch, setFocusSearch] =
     useState(0);
 
-  // Logic from Denis's favorites and directions services.
-  const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
-  const [favoritesLoading, setFavoritesLoading] = useState(true);
+  const {favorites, favoritesLoading, isFavorite, toggleFavorite} =
+    useFavoriteLocations();
   const [favoritesListVisible, setFavoritesListVisible] = useState(false);
   const [detailsVisible, setDetailsVisible] = useState(false);
   const [route, setRoute] = useState<RouteData | null>(null);
   const [routeLoading, setRouteLoading] = useState(false);
 
-  useEffect(() => {
-    let active = true;
-    loadFavorites()
-      .then(result => {
-        if (active) {
-          setFavorites(result.favorites);
-          setFavoritesLoading(false);
-        }
-      })
-      .catch(() => {
-        if (active) {
-          setFavoritesLoading(false);
-        }
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+
 
   const {
     initialLocation,
@@ -209,150 +153,7 @@ export function GoogleMap({
     return () => sequence.stop();
   }, [gpsToast, toastOpacity, toastY]);
 
-  useEffect(() => {
-    if (
-      !MotionModule ||
-      typeof MotionModule.addListener !== 'function' ||
-      typeof MotionModule.removeListeners !== 'function'
-    ) {
-      return;
-    }
 
-    let active = true;
-
-    const emitter =
-      new NativeEventEmitter(MotionModule);
-
-    const motion = emitter.addListener(
-      'MotionUpdate',
-      (...args: readonly Object[]) => {
-        const event = args[0] as
-          | {magnitude?: unknown}
-          | undefined;
-
-        const magnitude =
-          typeof event?.magnitude === 'number'
-            ? event.magnitude
-            : 0;
-
-        if (
-          !active ||
-          !Number.isFinite(magnitude) ||
-          magnitude < ACCELERATION_THRESHOLD
-        ) {
-          return;
-        }
-
-        setAccelerating(true);
-
-        if (motionTimerRef.current !== null) {
-          clearTimeout(motionTimerRef.current);
-        }
-
-        motionTimerRef.current = setTimeout(() => {
-          if (active) {
-            setAccelerating(false);
-          }
-        }, 1200);
-      },
-    );
-
-    const gyro = emitter.addListener(
-      'GyroscopeUpdate',
-      (...args: readonly Object[]) => {
-        const event = args[0] as
-          | {magnitude?: unknown}
-          | undefined;
-
-        const magnitude =
-          typeof event?.magnitude === 'number'
-            ? event.magnitude
-            : 0;
-
-        if (
-          !active ||
-          !Number.isFinite(magnitude) ||
-          magnitude < GYRO_THRESHOLD
-        ) {
-          return;
-        }
-
-        setRotating(true);
-
-        if (gyroTimerRef.current !== null) {
-          clearTimeout(gyroTimerRef.current);
-        }
-
-        gyroTimerRef.current = setTimeout(() => {
-          if (active) {
-            setRotating(false);
-          }
-        }, 900);
-      },
-    );
-
-    const orientation = emitter.addListener(
-      'OrientationUpdate',
-      (...args: readonly Object[]) => {
-        const event = args[0] as
-          | {heading?: unknown}
-          | undefined;
-
-        const value =
-          typeof event?.heading === 'number'
-            ? event.heading
-            : null;
-
-        if (
-          active &&
-          value !== null &&
-          Number.isFinite(value)
-        ) {
-          setHeading(value);
-        }
-      },
-    );
-
-    return () => {
-      active = false;
-
-      motion.remove();
-      gyro.remove();
-      orientation.remove();
-
-      if (motionTimerRef.current !== null) {
-        clearTimeout(motionTimerRef.current);
-      }
-
-      if (gyroTimerRef.current !== null) {
-        clearTimeout(gyroTimerRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      searchRequestRef.current++;
-
-      if (searchTimerRef.current !== null) {
-        clearTimeout(searchTimerRef.current);
-      }
-    };
-  }, []);
-
-  const cancelSearch = () => {
-    searchRequestRef.current++;
-
-    if (searchTimerRef.current !== null) {
-      clearTimeout(searchTimerRef.current);
-    }
-
-    searchTimerRef.current = null;
-
-    setSuggestions([]);
-    setSearchError('');
-    setSearchLoading(false);
-  };
 
   const selectDestination = (
     next: Destination,
@@ -400,37 +201,14 @@ export function GoogleMap({
 
   };
 
-  const favoriteKey = (latitude: number, longitude: number) =>
-    `${latitude.toFixed(4)},${longitude.toFixed(4)}`;
-
-  const currentFavorite =
-    destination !== null &&
-    favorites.some(
-      favorite =>
-        favoriteKey(favorite.latitude, favorite.longitude) ===
-        favoriteKey(destination.latitude, destination.longitude),
-    );
+  const currentFavorite = isFavorite(destination);
 
   const handleToggleFavorite = async () => {
-    if (!destination) {
-      return;
-    }
+    if (!destination) return;
     try {
-      if (currentFavorite) {
-        setFavorites(
-          await removeFavorite(destination.latitude, destination.longitude),
-        );
-      } else {
-        setFavorites(
-          await addFavorite({
-            name: destination.name,
-            latitude: destination.latitude,
-            longitude: destination.longitude,
-          }),
-        );
-      }
+      await toggleFavorite(destination);
     } catch (error) {
-      Alert.alert('Favorite', 'Nu am putut salva locația.');
+      Alert.alert('Favorite', 'Nu am putut salva loca?ia.');
       console.warn('Favorites error:', error);
     }
   };
@@ -448,176 +226,41 @@ export function GoogleMap({
 
   const handleGetDirections = async () => {
     if (!destination || !lastLocationRef.current) {
-      Alert.alert('Traseu', 'Locația curentă nu este încă disponibilă.');
+      Alert.alert(
+        'Traseu',
+        'Locația curentă nu este încă disponibilă.',
+      );
       return;
     }
+
     setRouteLoading(true);
+
     try {
-      // The Android manifest key is exposed by the existing PlacesModule.
-      // Requires adding getApiKey() to PlacesModule.kt (included separately).
-      const key = await PlacesModule?.getApiKey?.();
-      if (!key) {
-        throw new Error('Cheia Google Maps nu este disponibilă pentru Routes API.');
-      }
-      const result = await fetchRoute(
+      await openDirections(
         lastLocationRef.current,
-        {latitude: destination.latitude, longitude: destination.longitude},
-        key,
+        {
+          latitude: destination.latitude,
+          longitude: destination.longitude,
+        },
       );
-      setRoute(result);
+
       setDetailsVisible(false);
-      if (result.coordinates.length > 1) {
-        setTimeout(() => {
-          mapRef.current?.fitToCoordinates(result.coordinates, {
-            edgePadding: {top: 105, right: 70, bottom: 165, left: 70},
-            animated: true,
-          });
-        }, 250);
-      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Nu am putut calcula ruta.';
-      Alert.alert('Traseu', message);
+      console.warn('Navigation error:', error);
+
+      Alert.alert(
+        'Traseu',
+        'Nu am putut deschide Google Maps.',
+      );
     } finally {
       setRouteLoading(false);
     }
   };
 
-  const handleQueryChange = (
-    query: string,
-  ) => {
-    if (searchTimerRef.current !== null) {
-      clearTimeout(searchTimerRef.current);
-    }
 
-    searchTimerRef.current = null;
-
-    const requestId =
-      ++searchRequestRef.current;
-
-    setSearchError('');
-
-    if (query.trim().length < 2) {
-      setSuggestions([]);
-      setSearchLoading(false);
-      return;
-    }
-
-    if (!PlacesModule) {
-      setSuggestions([]);
-      setSearchLoading(false);
-
-      setSearchError(
-        'Google Places nu este disponibil.',
-      );
-
-      return;
-    }
-
-    setSearchLoading(true);
-
-    searchTimerRef.current = setTimeout(
-      async () => {
-        try {
-          const results =
-            await PlacesModule.searchPlaces(
-              query.trim(),
-            );
-
-          if (
-            requestId !==
-            searchRequestRef.current
-          ) {
-            return;
-          }
-
-          setSuggestions(
-            results.map(place => ({
-              id: place.id,
-              name: place.name,
-              latitude: 0,
-              longitude: 0,
-            })),
-          );
-
-          setSearchLoading(false);
-        } catch (error) {
-          console.warn(
-            'Places search:',
-            error,
-          );
-
-          if (
-            requestId !==
-            searchRequestRef.current
-          ) {
-            return;
-          }
-
-          setSuggestions([]);
-          setSearchLoading(false);
-
-          setSearchError(
-            'Nu am putut căuta destinații.',
-          );
-        }
-      },
-      400,
-    );
-  };
-
-  const handleSuggestionSelect = async (
-    place: Destination,
-  ) => {
-    cancelSearch();
-
-    if (!PlacesModule) {
-      return;
-    }
-
-    const requestId =
-      searchRequestRef.current;
-
-    try {
-      const selected =
-        await PlacesModule.getPlaceDetails(
-          place.id,
-        );
-
-      if (
-        requestId !==
-        searchRequestRef.current
-      ) {
-        return;
-      }
-
-      if (
-        !selected ||
-        !Number.isFinite(selected.latitude) ||
-        !Number.isFinite(selected.longitude)
-      ) {
-        setSearchError(
-          'Destinația nu are coordonate valide.',
-        );
-
-        return;
-      }
-
-      selectDestination(selected);
-    } catch (error) {
-      if (
-        requestId ===
-        searchRequestRef.current
-      ) {
-        console.warn(
-          'Places details:',
-          error,
-        );
-
-        setSearchError(
-          'Nu am putut încărca destinația.',
-        );
-      }
-    }
+  const handleSuggestionSelect = async (place: Destination) => {
+    const selected = await resolveSuggestion(place.id);
+    if (selected) selectDestination(selected);
   };
 
   const recenter = () => {
@@ -763,7 +406,7 @@ export function GoogleMap({
             loading={searchLoading}
             error={searchError}
             focusRequest={focusSearch}
-            onQueryChange={handleQueryChange}
+            onQueryChange={onQueryChange}
             onSelectDestination={
               handleSuggestionSelect
             }

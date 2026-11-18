@@ -12,8 +12,7 @@ class PlacesPackage : ReactPackage {
         reactContext: ReactApplicationContext
     ): List<NativeModule> {
         return listOf(
-            PlacesModule(reactContext),
-            MotionModule(reactContext)
+            PlacesModule(reactContext)
         )
     }
 
