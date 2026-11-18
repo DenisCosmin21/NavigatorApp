@@ -1,378 +1,322 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  FlatList,
-  StyleSheet,
-  Alert,
-  Keyboard,
-} from 'react-native';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
-import { LocationDetails } from './LocationDetails';
-import { FavoritesList } from './FavoritesList';
-import { RouteHistoryList } from './RouteHistoryList';
-import { getCurrentCoordinates, LatLng } from '../services/locationService';
-import { fetchRoute, RouteData, TravelMode } from '../services/directionsService';
-import {
-  fetchPlaceSuggestions,
-  fetchPlaceDetails,
-  PlacePrediction,
-} from '../services/placesService';
-import {
-  loadFavorites,
-  addFavorite,
-  removeFavorite,
-  FavoriteLocation,
-} from '../services/favoritesService';
-import {
-  loadSavedRoutes,
-  saveRoute,
-  removeRoute,
-  toggleRouteFavorite,
-  getRoutesByHistory,
-  updateRouteLastUsed,
-} from '../services/savedRoutesService';
-import { SavedRoute } from '../services/savedRouteModel';
 
-const DEFAULT_CENTER: LatLng = {
-  latitude: 45.7489,
-  longitude: 21.2087,
+import {openDirections} from '../services/navigationService';
+import React, {useEffect, useRef, useState} from 'react';
+import {
+  Alert,
+  Animated,
+  NativeModules,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import MapView, {Marker, Polyline, PROVIDER_GOOGLE} from 'react-native-maps';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import {DARK_MAP_STYLE} from './map/darkMapStyle';
+import {LocatingScreen} from './map/LocatingScreen';
+import {useLiveLocation} from './map/useLiveLocation';
+import {useMotionSensors} from './map/useMotionSensors';
+import {usePlaceSearch} from './map/usePlaceSearch';
+import {useFavoriteLocations} from './map/useFavoriteLocations';
+import {LocationDetails} from './LocationDetails';
+import {FavoritesList} from './FavoritesList';
+import {fetchRoute, type RouteData} from '../services/directionsService';
+import type {FavoriteLocation} from '../services/favoritesService';
+import {
+  DestinationSearch,
+  type Destination,
+} from './search/DestinationSearch';
+
+const MIN_SPEED_KMH = 2;
+
+type Coordinates = {
+  latitude: number;
+  longitude: number;
+};
+
+type PlacesNativeModule = {
+  getApiKey?(): Promise<string>;
 };
 
 
-interface TargetLocation {
-  name: string;
-  latitude: number;
-  longitude: number;
-}
+type GoogleMapProps = {
+  destination: Destination | null;
+  onDestinationChange: (
+    destination: Destination | null,
+  ) => void;
+  onOpenAccount: () => void;
+};
 
-interface GoogleMapProps {
-  googleApiKey: string;
-  initialLatitude?: number;
-  initialLongitude?: number;
-  initialLocationName?: string;
-  onFavoriteSave?: (location: TargetLocation, isFavorite: boolean) => void;
-}
+const PlacesModule = NativeModules.PlacesModule as
+  | PlacesNativeModule
+  | undefined;
+
 
 export function GoogleMap({
-  googleApiKey,
-  initialLatitude = DEFAULT_CENTER.latitude,
-  initialLongitude = DEFAULT_CENTER.longitude,
-  initialLocationName = 'Selected Location',
-  onFavoriteSave,
+  destination,
+  onDestinationChange,
+  onOpenAccount,
 }: GoogleMapProps) {
+  const insets = useSafeAreaInsets();
+
   const mapRef = useRef<MapView>(null);
+  const lastLocationRef = useRef<Coordinates | null>(null);
+  const followLocationRef = useRef(destination === null);
 
-  // Search state
-  const [searchQuery, setSearchQuery] = useState('');
-  const [predictions, setPredictions] = useState<PlacePrediction[]>([]);
 
-  // Selected target destination
-  const [targetLocation, setTargetLocation] = useState<TargetLocation>({
-    name: initialLocationName,
-    latitude: initialLatitude,
-    longitude: initialLongitude,
+  const toastOpacity =
+    useRef(new Animated.Value(0)).current;
+
+  const toastY =
+    useRef(new Animated.Value(-10)).current;
+
+
+  const {accelerating, rotating, heading} = useMotionSensors();
+
+  const [mapRotated, setMapRotated] =
+    useState(false);
+
+  const {
+    suggestions, searchError, searchLoading,
+    cancelSearch, onQueryChange, resolveSuggestion,
+  } = usePlaceSearch();
+
+  const [searchKey, setSearchKey] =
+    useState(0);
+
+  const [focusSearch, setFocusSearch] =
+    useState(0);
+
+  const {favorites, favoritesLoading, isFavorite, toggleFavorite} =
+    useFavoriteLocations();
+  const [favoritesListVisible, setFavoritesListVisible] = useState(false);
+  const [detailsVisible, setDetailsVisible] = useState(false);
+  const [route, setRoute] = useState<RouteData | null>(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+
+
+
+  const {
+    initialLocation,
+    currentLocation,
+    locationAllowed,
+    locationError,
+    gpsToast,
+    setGpsToast,
+    speedKmh,
+    retryLocation,
+  } = useLiveLocation(next => {
+    lastLocationRef.current = next;
+    if (followLocationRef.current && mapRef.current) {
+      mapRef.current.animateCamera({center: next}, {duration: 450});
+    }
   });
 
-  // Modal and favorites state
-  const [detailsVisible, setDetailsVisible] = useState(false);
-  const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
-  const [favoriteKeys, setFavoriteKeys] = useState<Set<string>>(new Set());
-  const [favoritesListVisible, setFavoritesListVisible] = useState(false);
-  const [loadingFavorites, setLoadingFavorites] = useState(true);
-
-  // Saved routes state
-  const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([]);
-  const [routeHistoryVisible, setRouteHistoryVisible] = useState(false);
-  const [loadingRoutes, setLoadingRoutes] = useState(true);
-
-  // Routing and user position
-  const [userLocation, setUserLocation] = useState<LatLng | null>(null);
-  const [route, setRoute] = useState<RouteData | null>(null);
-  const [loadingRoute, setLoadingRoute] = useState(false);
-  const [travelMode, setTravelMode] = useState<TravelMode>('DRIVE');
-  const [showingDirections, setShowingDirections] = useState(false);
-  const [navigationActive, setNavigationActive] = useState(false);
-
-  const handleSearchTextChange = async (text: string) => {
-    setSearchQuery(text);
-    if (text.trim().length < 2) {
-      setPredictions([]);
+  useEffect(() => {
+    if (!gpsToast) {
       return;
     }
 
-    try {
-      const results = await fetchPlaceSuggestions(text, googleApiKey);
-      setPredictions(results);
-    } catch (error) {
-      console.warn('Place search error:', error);
-    }
-  };
+    toastOpacity.setValue(0);
+    toastY.setValue(-10);
 
-  const handleSelectPrediction = async (prediction: PlacePrediction) => {
-    Keyboard.dismiss();
-    setPredictions([]);
-    setSearchQuery(prediction.mainText);
+    const sequence = Animated.sequence([
+      Animated.parallel([
+        Animated.timing(toastOpacity, {
+          toValue: 1,
+          duration: 250,
+          useNativeDriver: true,
+        }),
 
-    try {
-      const details = await fetchPlaceDetails(prediction.placeId, googleApiKey);
-      const newTarget: TargetLocation = {
-        name: details.name,
-        latitude: details.latitude,
-        longitude: details.longitude,
-      };
+        Animated.timing(toastY, {
+          toValue: 0,
+          duration: 250,
+          useNativeDriver: true,
+        }),
+      ]),
 
-      setTargetLocation(newTarget);
-      setRoute(null); // Clear previous polyline route
+      Animated.delay(1500),
 
-      mapRef.current?.animateCamera({
-        center: { latitude: details.latitude, longitude: details.longitude },
-        zoom: 15,
-      });
+      Animated.timing(toastOpacity, {
+        toValue: 0,
+        duration: 350,
+        useNativeDriver: true,
+      }),
+    ]);
 
-      setDetailsVisible(true);
-    } catch (error: any) {
-      Alert.alert(
-        'Error',
-        error.message || 'Unable to retrieve location details.',
-      );
-    }
-  };
-
-  // Load saved favorites on mount
-  useEffect(() => {
-    setLoadingFavorites(true);
-    loadFavorites().then(result => {
-      setFavorites(result.favorites);
-      const keys = new Set(
-        result.favorites.map(
-          f =>
-            `${f.latitude.toFixed(4)},${f.longitude.toFixed(4)}`,
-        ),
-      );
-      setFavoriteKeys(keys);
-      setLoadingFavorites(false);
-
-      // Show error alert if API failed but local favorites are available
-      if (result.error) {
-        Alert.alert(
-          'Connection Error',
-          `Unable to sync favorites with server: ${result.error}\n\nShowing ${result.favorites.length} locally saved favorite(s).`,
-          [{ text: 'OK' }],
-        );
+    sequence.start(({finished}) => {
+      if (finished) {
+        setGpsToast(false);
       }
     });
-  }, []);
 
-  // Load saved routes on mount
-  useEffect(() => {
-    setLoadingRoutes(true);
-    loadSavedRoutes().then(result => {
-      const sorted = getRoutesByHistory(result.routes);
-      setSavedRoutes(sorted);
-      setLoadingRoutes(false);
-    });
-  }, []);
+    return () => sequence.stop();
+  }, [gpsToast, toastOpacity, toastY]);
 
-  const handleZoom = async (delta: number) => {
-    if (!mapRef.current) return;
-    const camera = await mapRef.current.getCamera();
-    if (camera.zoom !== undefined) {
-      mapRef.current.animateCamera({
-        zoom: Math.min(Math.max(camera.zoom + delta, 2), 20),
-      });
-    }
-  };
 
-  const handleGetDirections = useCallback(async () => {
-    setLoadingRoute(true);
-    try {
-      const origin = await getCurrentCoordinates();
-      setUserLocation(origin);
 
-      const routeData = await fetchRoute(
-        origin,
-        {
-          latitude: targetLocation.latitude,
-          longitude: targetLocation.longitude,
+  const selectDestination = (
+    next: Destination,
+  ) => {
+    followLocationRef.current = false;
+
+    onDestinationChange(next);
+    setRoute(null);
+    setDetailsVisible(false);
+
+    cancelSearch();
+
+    mapRef.current?.animateCamera(
+      {
+        center: {
+          latitude: next.latitude,
+          longitude: next.longitude,
         },
-        googleApiKey,
-        travelMode,
-      );
-
-      setRoute(routeData);
-      setDetailsVisible(false);
-      setShowingDirections(true);
-
-      // Guard against empty coordinate arrays that cause native crashes
-      if (routeData.coordinates && routeData.coordinates.length > 1) {
-        setTimeout(() => {
-          mapRef.current?.fitToCoordinates(routeData.coordinates, {
-            edgePadding: { top: 80, right: 40, bottom: 80, left: 40 },
-            animated: true,
-          });
-        }, 300);
-      }
-    } catch (error: any) {
-      Alert.alert(
-        'Route Error',
-        error.message || 'Failed to calculate directions.',
-      );
-    } finally {
-      setLoadingRoute(false);
-    }
-  }, [targetLocation, googleApiKey, travelMode, saveRoute, getRoutesByHistory]);
-
-  // Close the current directions view and clear the route
-  const handleCloseDirections = () => {
-    setRoute(null);
-    setShowingDirections(false);
-    setNavigationActive(false);
-  };
-
-  // Lock the travel mode - user cannot change between car/foot anymore
-  const handleStartNavigation = () => {
-    setNavigationActive(true);
-  };
-
-  // Cancel navigation mode and close directions
-  const handleCancelNavigation = () => {
-    setNavigationActive(false);
-    setRoute(null);
-    setShowingDirections(false);
-  };
-
-  // Save the currently displayed route to history manually
-  const handleSaveRoute = async () => {
-    if (!route || !userLocation) return;
-
-    const savedRoute: SavedRoute = {
-      name: targetLocation.name,
-      origin: userLocation,
-      destination: {
-        latitude: targetLocation.latitude,
-        longitude: targetLocation.longitude,
+        zoom: 15,
       },
-      destinationName: targetLocation.name,
-      coordinates: route.coordinates,
-      distanceMeters: route.distanceMeters,
-      durationSeconds: route.durationSeconds,
-      travelMode,
-      isFavorite: false,
-      createdAt: new Date().toISOString(),
-    };
-
-    const updatedRoutes = await saveRoute(savedRoute);
-    setSavedRoutes(getRoutesByHistory(updatedRoutes));
+      {duration: 550},
+    );
   };
 
-  // Favorite toggle handling
-  const locationKey = `${targetLocation.latitude.toFixed(
-    4,
-  )},${targetLocation.longitude.toFixed(4)}`;
-  const isCurrentTargetFavorite = favoriteKeys.has(locationKey);
+  const clearDestination = () => {
+    onDestinationChange(null);
+    setRoute(null);
+    setDetailsVisible(false);
+
+    cancelSearch();
+
+    setSearchKey(value => value + 1);
+
+    followLocationRef.current = true;
+
+    if (lastLocationRef.current) {
+      mapRef.current?.animateCamera(
+        {
+          center: lastLocationRef.current,
+          zoom: 16,
+        },
+        {duration: 500},
+      );
+    }
+
+  };
+
+  const currentFavorite = isFavorite(destination);
 
   const handleToggleFavorite = async () => {
-    const nextFavoriteState = !isCurrentTargetFavorite;
-
-    if (nextFavoriteState) {
-      // Add to favorites
-      const updated = await addFavorite({
-        name: targetLocation.name,
-        latitude: targetLocation.latitude,
-        longitude: targetLocation.longitude,
-      });
-      setFavorites(updated);
-      setFavoriteKeys(prev => new Set(prev).add(locationKey));
-    } else {
-      // Remove from favorites
-      const updated = await removeFavorite(
-        targetLocation.latitude,
-        targetLocation.longitude,
-      );
-      setFavorites(updated);
-      setFavoriteKeys(prev => {
-        const next = new Set(prev);
-        next.delete(locationKey);
-        return next;
-      });
+    if (!destination) return;
+    try {
+      await toggleFavorite(destination);
+    } catch (error) {
+      Alert.alert('Favorite', 'Nu am putut salva loca?ia.');
+      console.warn('Favorites error:', error);
     }
-
-    onFavoriteSave?.(targetLocation, nextFavoriteState);
   };
 
-  // Handle selecting a favorite from the list
   const handleSelectFavorite = (favorite: FavoriteLocation) => {
-    const newTarget: TargetLocation = {
+    selectDestination({
+      id: `favorite-${favorite.latitude}-${favorite.longitude}`,
       name: favorite.name,
       latitude: favorite.latitude,
       longitude: favorite.longitude,
-    };
-
-    setTargetLocation(newTarget);
-    setRoute(null);
-
-    mapRef.current?.animateCamera({
-      center: { latitude: favorite.latitude, longitude: favorite.longitude },
-      zoom: 15,
     });
-
+    setFavoritesListVisible(false);
     setDetailsVisible(true);
   };
 
-  // Handle selecting a saved route from history
-  const handleSelectSavedRoute = (savedRoute: SavedRoute) => {
-    // Update the last used timestamp
-    if (savedRoute.id) {
-      updateRouteLastUsed(savedRoute.id).then(updated => {
-        setSavedRoutes(getRoutesByHistory(updated));
-      });
+  const handleGetDirections = async () => {
+    if (!destination || !lastLocationRef.current) {
+      Alert.alert(
+        'Traseu',
+        'Locația curentă nu este încă disponibilă.',
+      );
+      return;
     }
 
-    const newTarget: TargetLocation = {
-      name: savedRoute.name || savedRoute.destinationName,
-      latitude: savedRoute.destination.latitude,
-      longitude: savedRoute.destination.longitude,
-    };
+    setRouteLoading(true);
 
-    setTargetLocation(newTarget);
-    
-    // Display the saved route polyline on the map
-    const routeData: RouteData = {
-      coordinates: savedRoute.coordinates,
-      distanceMeters: savedRoute.distanceMeters,
-      durationSeconds: savedRoute.durationSeconds,
-    };
-    setRoute(routeData);
-    setShowingDirections(true);
+    try {
+      await openDirections(
+        lastLocationRef.current,
+        {
+          latitude: destination.latitude,
+          longitude: destination.longitude,
+        },
+      );
 
-    // Set user location to the origin of the saved route
-    setUserLocation(savedRoute.origin);
+      setDetailsVisible(false);
+    } catch (error) {
+      console.warn('Navigation error:', error);
 
-    // Fit the map to show the entire route
-    if (savedRoute.coordinates && savedRoute.coordinates.length > 1) {
-      setTimeout(() => {
-        mapRef.current?.fitToCoordinates(savedRoute.coordinates, {
-          edgePadding: { top: 80, right: 40, bottom: 80, left: 40 },
-          animated: true,
-        });
-      }, 300);
+      Alert.alert(
+        'Traseu',
+        'Nu am putut deschide Google Maps.',
+      );
+    } finally {
+      setRouteLoading(false);
     }
   };
 
-  // Handle toggling favorite for a saved route
-  const handleToggleRouteFavorite = async (id: string) => {
-    const updated = await toggleRouteFavorite(id);
-    setSavedRoutes(getRoutesByHistory(updated));
+
+  const handleSuggestionSelect = async (place: Destination) => {
+    const selected = await resolveSuggestion(place.id);
+    if (selected) selectDestination(selected);
   };
 
-  // Handle deleting a saved route
-  const handleDeleteRoute = async (id: string) => {
-    const updated = await removeRoute(id);
-    setSavedRoutes(getRoutesByHistory(updated));
+  const recenter = () => {
+    if (!lastLocationRef.current) {
+      return;
+    }
+
+    followLocationRef.current = true;
+
+    mapRef.current?.animateCamera(
+      {
+        center: lastLocationRef.current,
+        zoom: 16,
+      },
+      {duration: 500},
+    );
   };
+
+  const toggleCompass = () => {
+    const shouldRotate =
+      !mapRotated && heading !== null;
+
+    mapRef.current?.animateCamera(
+      {
+        heading: shouldRotate
+          ? heading ?? 0
+          : 0,
+      },
+      {duration: 350},
+    );
+
+    setMapRotated(shouldRotate);
+  };
+
+  const top =
+    Math.max(insets.top, 18) + 12;
+
+  const bottom =
+    Math.max(insets.bottom, 12) + 12;
+
+  if (initialLocation === null) {
+    return (
+      <LocatingScreen
+        error={locationError}
+        onRetry={retryLocation}
+        onOpenAccount={onOpenAccount}
+      />
+    );
+  }
+
+  const initialCenter = destination
+    ? {
+        latitude: destination.latitude,
+        longitude: destination.longitude,
+      }
+    : initialLocation;
 
   return (
     <View style={styles.container}>
@@ -380,254 +324,312 @@ export function GoogleMap({
         ref={mapRef}
         provider={PROVIDER_GOOGLE}
         style={styles.map}
+
+        customMapStyle={DARK_MAP_STYLE}
         initialRegion={{
-          latitude: DEFAULT_CENTER.latitude,
-          longitude: DEFAULT_CENTER.longitude,
-          latitudeDelta: 0.08,
-          longitudeDelta: 0.08,
+          ...initialCenter,
+          latitudeDelta: 0.017,
+          longitudeDelta: 0.017,
         }}
-
+        showsUserLocation={false}
+        showsMyLocationButton={false}
+        showsCompass={false}
+        toolbarEnabled={false}
+        onPanDrag={() => {
+          followLocationRef.current = false;
+        }}
         onPress={event => {
-          // Prevent iOS from firing onPress at the same time as onPoiClick
-          if ((event.nativeEvent as any).action === 'poi-click') return;
+          const {
+            latitude,
+            longitude,
+          } = event.nativeEvent.coordinate;
 
-          // Don't allow changing location while directions are showing
-          if (showingDirections) return;
-
-          const { latitude, longitude } = event.nativeEvent.coordinate;
-
-          setTargetLocation({
-            name: `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`,
+          selectDestination({
+            id: `point-${latitude}-${longitude}`,
+            name: 'Punct selectat pe hartă',
             latitude,
             longitude,
           });
 
-          setRoute(null);
-          setDetailsVisible(true);
-        }}
-        onPoiClick={event => {
-          // Don't allow changing location while directions are showing
-          if (showingDirections) return;
+          setSearchKey(value => value + 1);
+        }}>
 
-          const { coordinate, name } = event.nativeEvent;
-          setTargetLocation({
-            name:
-              name ||
-              `${coordinate.latitude.toFixed(
-                4,
-              )}, ${coordinate.longitude.toFixed(4)}`,
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude,
-          });
-
-          setRoute(null);
-          setDetailsVisible(true);
-        }}
-      >
-        <Marker
-          coordinate={{
-            latitude: targetLocation.latitude,
-            longitude: targetLocation.longitude,
-          }}
-          title={targetLocation.name}
-          onPress={() => {
-            if (!showingDirections) {
-              setDetailsVisible(true);
-            }
-          }}
-        />
-
-        {userLocation && route && (
+        {currentLocation && locationAllowed && (
           <Marker
-            coordinate={userLocation}
-            title="Your Location"
-            pinColor="#007AFF"
+            coordinate={currentLocation}
+            anchor={{x: 0.5, y: 0.5}}
+            tracksViewChanges={false}
+            zIndex={5}
+            title="Locația mea">
+
+            <View style={styles.userHalo}>
+              <View style={styles.userHaloInner}>
+                <View style={styles.userDot} />
+              </View>
+            </View>
+
+          </Marker>
+        )}
+
+        {route && route.coordinates.length > 1 && (
+          <Polyline
+            coordinates={route.coordinates}
+            strokeColor="#3B82F6"
+            strokeWidth={5}
           />
         )}
 
-        {route && (
-          <Polyline
-            coordinates={route.coordinates}
-            strokeWidth={4}
-            strokeColor="#007AFF"
+        {destination !== null && (
+          <Marker
+            coordinate={{
+              latitude: destination.latitude,
+              longitude: destination.longitude,
+            }}
+            title={destination.name}
+            pinColor="#3B82F6"
+            onPress={() => setDetailsVisible(true)}
           />
         )}
       </MapView>
 
-      {/* Autocomplete Search Bar */}
-      <View style={styles.searchContainer}>
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Search location or address..."
-          placeholderTextColor="#8E8E93"
-          value={searchQuery}
-          onChangeText={handleSearchTextChange}
-          returnKeyType="search"
-          clearButtonMode="while-editing"
-        />
 
-        {predictions.length > 0 && (
-          <View style={styles.dropdown}>
-            <FlatList
-              data={predictions}
-              keyExtractor={item => item.placeId}
-              keyboardShouldPersistTaps="handled"
-              renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={styles.dropdownItem}
-                  onPress={() => handleSelectPrediction(item)}
-                >
-                  <Text style={styles.mainPlaceText}>{item.mainText}</Text>
-                  {!!item.secondaryText && (
-                    <Text style={styles.secondaryPlaceText} numberOfLines={1}>
-                      {item.secondaryText}
-                    </Text>
-                  )}
-                </TouchableOpacity>
-              )}
-            />
-          </View>
-        )}
-      </View>
+      <View
+        style={[
+          styles.topRow,
+          {top},
+        ]}>
 
-      <View style={styles.zoomContainer}>
+        <View style={styles.searchArea}>
+          <DestinationSearch
+            key={searchKey}
+            suggestions={suggestions}
+            loading={searchLoading}
+            error={searchError}
+            focusRequest={focusSearch}
+            onQueryChange={onQueryChange}
+            onSelectDestination={
+              handleSuggestionSelect
+            }
+          />
+        </View>
+
         <TouchableOpacity
-          style={styles.zoomButton}
-          onPress={() => handleZoom(1)}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.zoomText}>+</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.zoomButton}
-          onPress={() => handleZoom(-1)}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.zoomText}>−</Text>
+          style={styles.accountButton}
+          onPress={onOpenAccount}
+          accessibilityLabel="Contul meu">
+
+          <View style={styles.avatarHead} />
+          <View style={styles.avatarBody} />
+
         </TouchableOpacity>
       </View>
 
-      {/* Distance and Duration Indicator - only visible when showing directions */}
-      {showingDirections && route && (
-        <View style={styles.routeBadgeContainer}>
-          <View style={styles.routeBadge}>
-            <Text style={styles.routeBadgeText}>
-              {(route.distanceMeters / 1000).toFixed(1)} km (
-              {Math.round(route.durationSeconds / 60)} min)
+      {gpsToast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.gpsToast,
+            {
+              top: top + 70,
+              opacity: toastOpacity,
+              transform: [
+                {translateY: toastY},
+              ],
+            },
+          ]}>
+
+          <View style={styles.checkCircle}>
+            <Text style={styles.checkText}>
+              ✓
             </Text>
           </View>
-          {!navigationActive && (
-            <>
-              <TouchableOpacity
-                style={styles.saveRouteButton}
-                onPress={handleSaveRoute}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.saveRouteButtonText}>💾</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.startNavigationButton}
-                onPress={handleStartNavigation}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.startNavigationButtonText}>▶</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.closeDirectionsButton}
-                onPress={handleCloseDirections}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.closeDirectionsButtonText}>✕</Text>
-              </TouchableOpacity>
-            </>
-          )}
-          {navigationActive && (
-            <TouchableOpacity
-              style={styles.cancelNavigationButton}
-              onPress={handleCancelNavigation}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.cancelNavigationButtonText}>Cancel</Text>
-            </TouchableOpacity>
-          )}
+
+          <Text style={styles.toastText}>
+            Locație detectată
+          </Text>
+
+        </Animated.View>
+      )}
+
+      {speedKmh >= MIN_SPEED_KMH && (
+        <View
+          style={[
+            styles.speedCircle,
+            {
+              bottom: bottom + 104,
+            },
+          ]}>
+
+          <Text style={styles.speedNumber}>
+            {speedKmh}
+          </Text>
+
+          <Text style={styles.speedUnit}>
+            km/h
+          </Text>
+
+          <View
+            style={[
+              styles.speedDot,
+              accelerating &&
+                styles.speedDotActive,
+            ]}
+          />
         </View>
       )}
 
-      {/* Travel Mode Toggle Button - only visible when showing directions and navigation is NOT active */}
-      {showingDirections && !navigationActive && (
+      <View
+        style={[
+          styles.rightControls,
+          {
+            bottom: bottom + 106,
+          },
+        ]}>
+
         <TouchableOpacity
-          style={styles.travelModeButton}
-          onPress={() => {
-            const newMode = travelMode === 'DRIVE' ? 'WALK' : 'DRIVE';
-            setTravelMode(newMode);
-            // Reload directions with the new mode
-            handleGetDirections();
-          }}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.travelModeButtonText}>{travelMode === 'DRIVE' ? '🚗' : '🚶'}</Text>
+          style={[
+            styles.roundButton,
+            rotating && styles.roundActive,
+          ]}
+          onPress={toggleCompass}
+          accessibilityLabel="Orientează harta">
+
+          <Text style={styles.northLetter}>
+            N
+          </Text>
+
+          <Text
+            style={[
+              styles.compassNeedle,
+              {
+                transform: [
+                  {
+                    rotate:
+                      `${heading ?? 0}deg`,
+                  },
+                ],
+              },
+            ]}>
+            ▲
+          </Text>
         </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.roundButton}
+          onPress={recenter}
+          accessibilityLabel="Locația curentă">
+
+          <Text style={styles.recenterIcon}>
+            ◎
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      <TouchableOpacity
+        style={[styles.favoritesFloating, {bottom: bottom + 220}]}
+        onPress={() => setFavoritesListVisible(true)}
+        accessibilityLabel="Locații favorite">
+        <Text style={styles.favoritesFloatingText}>★</Text>
+        {favorites.length > 0 && (
+          <View style={styles.favoriteCountBadge}>
+            <Text style={styles.favoriteCountText}>{favorites.length}</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+
+      {route && (
+        <View style={[styles.routeBadge, {bottom: bottom + 95}]}>
+          <Text style={styles.routeBadgeText}>
+            {(route.distanceMeters / 1000).toFixed(1)} km · {Math.round(route.durationSeconds / 60)} min
+          </Text>
+        </View>
       )}
 
-      {/* Favorites Button */}
-      <TouchableOpacity
-        style={styles.favoritesButton}
-        onPress={() => setFavoritesListVisible(true)}
-        activeOpacity={0.7}
-      >
-        <Text style={styles.favoritesButtonText}>★</Text>
-        {favorites.length > 0 && (
-          <View style={styles.favoritesBadge}>
-            <Text style={styles.favoritesBadgeText}>{favorites.length}</Text>
+      {destination !== null && (
+        <View
+          style={[
+            styles.destinationCard,
+            {bottom},
+          ]}>
+
+          <View style={styles.destinationIcon}>
+            <Text style={styles.destinationPin}>
+              ⌖
+            </Text>
           </View>
-        )}
-      </TouchableOpacity>
 
-      {/* Route History Button */}
-      <TouchableOpacity
-        style={styles.routeHistoryButton}
-        onPress={() => setRouteHistoryVisible(true)}
-        activeOpacity={0.7}
-      >
-        <Text style={styles.routeHistoryButtonText}>🕐</Text>
-        {savedRoutes.length > 0 && (
-          <View style={styles.routeHistoryBadge}>
-            <Text style={styles.routeHistoryBadgeText}>{savedRoutes.length}</Text>
+          <View style={styles.destinationDetails}>
+            <Text style={styles.destinationTitle}>
+              Destinație selectată
+            </Text>
+
+            <Text
+              style={styles.destinationSubtitle}
+              numberOfLines={1}>
+              {destination.name}
+            </Text>
           </View>
-        )}
-      </TouchableOpacity>
 
-      {/* Location Details Sheet */}
-      <LocationDetails
-        name={targetLocation.name}
-        latitude={targetLocation.latitude}
-        longitude={targetLocation.longitude}
-        visible={detailsVisible}
-        isFavorite={isCurrentTargetFavorite}
-        loadingRoute={loadingRoute}
-        onToggleFavorite={handleToggleFavorite}
-        onGetDirections={handleGetDirections}
-        onClose={() => setDetailsVisible(false)}
-      />
+          <TouchableOpacity
+            style={styles.clearDestination}
+            onPress={clearDestination}
+            accessibilityLabel="Șterge destinația">
 
-      {/* Favorites List Modal */}
+            <Text
+              style={styles.clearDestinationText}>
+              ×
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.destinationAction}
+            onPress={() => setDetailsVisible(true)}
+            accessibilityLabel="Detalii, favorite și traseu">
+
+            <Text style={styles.destinationArrow}>
+              ➜
+            </Text>
+          </TouchableOpacity>
+
+        </View>
+      )}
+
+      {locationError !== '' && (
+        <View
+          style={[
+            styles.errorBanner,
+            {
+              top: top + 75,
+            },
+          ]}>
+
+          <Text style={styles.errorBannerText}>
+            {locationError}
+          </Text>
+
+        </View>
+      )}
+
+      {destination !== null && (
+        <LocationDetails
+          name={destination.name}
+          latitude={destination.latitude}
+          longitude={destination.longitude}
+          visible={detailsVisible}
+          isFavorite={!!currentFavorite}
+          loadingRoute={routeLoading}
+          onToggleFavorite={handleToggleFavorite}
+          onGetDirections={handleGetDirections}
+          onClose={() => setDetailsVisible(false)}
+        />
+      )}
+
       <FavoritesList
         visible={favoritesListVisible}
         favorites={favorites}
-        loading={loadingFavorites}
+        loading={favoritesLoading}
         onSelect={handleSelectFavorite}
         onClose={() => setFavoritesListVisible(false)}
-      />
-
-      {/* Route History Modal */}
-      <RouteHistoryList
-        visible={routeHistoryVisible}
-        routes={savedRoutes}
-        loading={loadingRoutes}
-        onSelect={handleSelectSavedRoute}
-        onToggleFavorite={handleToggleRouteFavorite}
-        onDelete={handleDeleteRoute}
-        onClose={() => setRouteHistoryVisible(false)}
       />
     </View>
   );
@@ -636,271 +638,335 @@ export function GoogleMap({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: '#07142E',
   },
+
   map: {
-    width: '100%',
-    height: '100%',
+    flex: 1,
   },
-  searchContainer: {
+
+
+  topRow: {
     position: 'absolute',
-    top: 50,
-    left: 16,
-    right: 16,
-    zIndex: 10,
+    left: 15,
+    right: 15,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    zIndex: 30,
   },
-  searchInput: {
-    height: 48,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    fontSize: 15,
-    color: '#1C1C1E',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 4,
+
+  searchArea: {
+    flex: 1,
   },
-  dropdown: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    marginTop: 6,
-    maxHeight: 220,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 5,
+
+  accountButton: {
+    width: 55,
+    height: 55,
+    borderRadius: 28,
+    backgroundColor: '#16437F',
+    borderWidth: 1,
+    borderColor: '#3E78C9',
+    alignItems: 'center',
+    justifyContent: 'center',
     elevation: 6,
   },
-  dropdownItem: {
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  mainPlaceText: {
-    fontSize: 15,
-    fontWeight: '500',
-    color: '#1C1C1E',
-  },
-  secondaryPlaceText: {
-    fontSize: 12,
-    color: '#8E8E93',
-    marginTop: 2,
-  },
-  zoomContainer: {
-    position: 'absolute',
-    right: 16,
-    bottom: 40,
-    zIndex: 5,
-  },
-  zoomButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+
+  avatarHead: {
+    width: 13,
+    height: 13,
+    borderRadius: 7,
     backgroundColor: '#FFFFFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 4,
-    elevation: 4,
+    marginBottom: 3,
   },
-  zoomText: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    color: '#1C1C1E',
-    lineHeight: 24,
+
+  avatarBody: {
+    width: 25,
+    height: 13,
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+    backgroundColor: '#FFFFFF',
   },
-  routeBadgeContainer: {
+
+  gpsToast: {
     position: 'absolute',
-    bottom: 40,
-    left: 16,
+    alignSelf: 'center',
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    borderRadius: 25,
+    paddingLeft: 9,
+    paddingRight: 17,
+    paddingVertical: 9,
+    backgroundColor: '#082821',
+    borderColor: '#27BC66',
+    borderWidth: 1,
+    elevation: 7,
+    zIndex: 15,
   },
-  routeBadge: {
-    backgroundColor: '#1C1C1E',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3,
-    elevation: 5,
+
+  checkCircle: {
+    width: 27,
+    height: 27,
+    borderRadius: 14,
+    marginRight: 9,
+    backgroundColor: '#20C85A',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  routeBadgeText: {
+
+  checkText: {
     color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  saveRouteButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#1C1C1E',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3,
-    elevation: 5,
-  },
-  saveRouteButtonText: {
     fontSize: 18,
+    fontWeight: '900',
   },
-  startNavigationButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#34C759',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3,
-    elevation: 5,
-  },
-  startNavigationButtonText: {
-    fontSize: 18,
+
+  toastText: {
     color: '#FFFFFF',
     fontWeight: '700',
+    fontSize: 12,
   },
-  cancelNavigationButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 20,
-    backgroundColor: '#FF3B30',
-    justifyContent: 'center',
+
+  userHalo: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(31,106,255,0.19)',
+  },
+
+  userHaloInner: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(28,110,255,0.40)',
+  },
+
+  userDot: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#298BFF',
+    borderColor: '#FFFFFF',
+    borderWidth: 4,
+  },
+
+  speedCircle: {
+    position: 'absolute',
+    left: 15,
+    width: 78,
+    height: 78,
+    borderRadius: 39,
+    backgroundColor: '#142C4E',
+    borderColor: '#4D84D2',
+    borderWidth: 2,
+    elevation: 5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  speedNumber: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: '#FFFFFF',
+  },
+
+  speedUnit: {
+    fontSize: 10,
+    color: '#B8CDEE',
+    marginTop: -3,
+  },
+
+  speedDot: {
+    position: 'absolute',
+    top: 8,
+    right: 10,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#4079C1',
+  },
+
+  speedDotActive: {
+    backgroundColor: '#2DDD73',
+  },
+
+  rightControls: {
+    position: 'absolute',
+    right: 15,
+    alignItems: 'center',
+    gap: 12,
+  },
+
+  roundButton: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: '#142C4E',
+    borderColor: '#4779BC',
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
     elevation: 5,
   },
-  cancelNavigationButtonText: {
+
+  roundActive: {
+    borderColor: '#52BFFF',
+    borderWidth: 2,
+  },
+
+  northLetter: {
+    fontSize: 11,
+    color: '#FC6974',
+    fontWeight: '900',
+    lineHeight: 13,
+  },
+
+  compassNeedle: {
+    fontSize: 19,
+    lineHeight: 22,
+    color: '#FFFFFF',
+  },
+
+  recenterIcon: {
+    fontSize: 31,
+    lineHeight: 36,
+    color: '#FFFFFF',
+  },
+
+  destinationCard: {
+    position: 'absolute',
+    left: 14,
+    right: 14,
+    minHeight: 84,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 15,
+    paddingRight: 13,
+    borderRadius: 24,
+    backgroundColor: '#102645',
+    borderColor: '#345A91',
+    borderWidth: 1,
+    elevation: 8,
+  },
+
+  destinationIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: '#1B4B90',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+
+  destinationPin: {
+    fontSize: 28,
+    color: '#FFFFFF',
+    lineHeight: 35,
+  },
+
+  destinationDetails: {
+    flex: 1,
+  },
+
+  destinationTitle: {
+    color: '#FFFFFF',
     fontSize: 15,
-    color: '#FFFFFF',
-    fontWeight: '700',
+    fontWeight: '800',
   },
-  closeDirectionsButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#FF3B30',
-    justifyContent: 'center',
+
+  destinationSubtitle: {
+    color: '#B3C7E6',
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  clearDestination: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#2D4669',
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3,
-    elevation: 5,
-  },
-  closeDirectionsButtonText: {
-    fontSize: 18,
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
-  favoritesButton: {
-    position: 'absolute',
-    top: 50,
-    right: 16,
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
+    marginLeft: 5,
+  },
+
+  clearDestinationText: {
+    fontSize: 21,
+    lineHeight: 25,
+    color: '#FFFFFF',
+  },
+
+  destinationAction: {
+    width: 41,
+    height: 41,
+    borderRadius: 21,
+    backgroundColor: '#1265F3',
     alignItems: 'center',
-    zIndex: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 4,
+    justifyContent: 'center',
+    marginLeft: 8,
   },
-  favoritesButtonText: {
-    fontSize: 22,
-    color: '#F5A623',
+
+  destinationArrow: {
+    fontSize: 26,
+    lineHeight: 31,
+    color: '#FFFFFF',
   },
-  favoritesBadge: {
+
+  errorBanner: {
     position: 'absolute',
-    top: -4,
-    right: -4,
-    backgroundColor: '#FF3B30',
+    left: 20,
+    right: 20,
+    backgroundColor: '#502736',
+    borderColor: '#E87C8E',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 11,
+    zIndex: 25,
+  },
+
+  errorBannerText: {
+    color: '#FFE4E8',
+    fontSize: 12,
+
+  },
+
+
+  favoritesFloating: {
+    position: 'absolute',
+    right: 15,
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: '#4779BC',
+    backgroundColor: '#142C4E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 6,
+  },
+  favoritesFloatingText: {fontSize: 27, color: '#FFD36D'},
+  favoriteCountBadge: {
+    position: 'absolute',
+    right: -5,
+    top: -5,
     borderRadius: 10,
-    minWidth: 20,
-    height: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 4,
+    paddingHorizontal: 5,
+    backgroundColor: '#236DE6',
   },
-  favoritesBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  routeHistoryButton: {
+  favoriteCountText: {color: '#FFFFFF', fontSize: 11, fontWeight: '700'},
+  routeBadge: {
     position: 'absolute',
-    top: 106,
-    right: 16,
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#FFFFFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 4,
+    alignSelf: 'center',
+    borderRadius: 16,
+    backgroundColor: '#142C4E',
+    borderWidth: 1,
+    borderColor: '#4779BC',
+    paddingHorizontal: 15,
+    paddingVertical: 9,
   },
-  routeHistoryButtonText: {
-    fontSize: 22,
-  },
-  routeHistoryBadge: {
-    position: 'absolute',
-    top: -4,
-    right: -4,
-    backgroundColor: '#007AFF',
-    borderRadius: 10,
-    minWidth: 20,
-    height: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 4,
-  },
-  routeHistoryBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  travelModeButton: {
-    position: 'absolute',
-    top: 162,
-    right: 16,
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#FFFFFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  travelModeButtonText: {
-    fontSize: 22,
-  },
+  routeBadgeText: {color: '#FFFFFF', fontSize: 13, fontWeight: '700'},
 });
